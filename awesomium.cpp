@@ -14,147 +14,502 @@
 #include <v8.h>
 #include <node.h>
 #include <iostream>
- 
-// Various included headers
+#include <node_events.h>
+#include <assert.h>
+#include <stdlib.h>
 #include <Awesomium/WebCore.h>
-#include <iostream>
 #include <string>
 #include <sstream>
-#if defined(__WIN32__) || defined(_WIN32)
-#include <windows.h>
-#elif defined(__APPLE__)
 #include <unistd.h>
-#endif
-
+ 
 using namespace node;
 using namespace v8;
 using namespace std;
 
+static Persistent<String> ready_symbol;
+static Persistent<String> result_symbol;
+static Persistent<String> close_symbol;
+static Persistent<String> connect_symbol;
+static Persistent<String> notify_symbol;
+// #define READY_STATE_SYMBOL String::NewSymbol("readyState")
+// #define MAP_TUPLE_ITEMS_SYMBOL String::NewSymbol("mapTupleItems")
 
-#define REQ_FUN_ARG(I, VAR)                                             \
-  if (args.Length() <= (I) || !args[I]->IsFunction())                   \
-    return ThrowException(Exception::TypeError(                         \
-                  String::New("Argument " #I " must be a function")));  \
-  Local<Function> VAR = Local<Function>::Cast(args[I]);
+class Awesomium : public EventEmitter {
+	public:
+	static void
+	Initialize (v8::Handle<v8::Object> target)
+	{
+		HandleScope scope;
 
-class Awesomium: ObjectWrap
-{
-private:
-  int m_count;
-public:
+		Local<FunctionTemplate> t = FunctionTemplate::New(New);
 
-  static Persistent<FunctionTemplate> s_ct;
-  static void Init(Handle<Object> target)
-  {
-    HandleScope scope;
+		t->Inherit(EventEmitter::constructor_template);
+		t->InstanceTemplate()->SetInternalFieldCount(1);
 
-    Local<FunctionTemplate> t = FunctionTemplate::New(New);
+		/* EVENTS the Awesomium::WebViewListener Exposes
+			onBeginNavigation
+			onBeginLoading
+			onFinishLoading
+			onCallback
+			onReceiveTitle
+			onChangeTooltip
+			onChangeCursor
+			onChangeKeyboardFocus
+			onChangeTargetURL
+			onOpenExternalLink
+			onRequestDownload
+			onWebViewCrashed
+			onPluginCrashed
+			onRequestMove
+			onGetPageContents
+			onDOMReady
+			onRequestFileChooser
+			onGetScrollData
+			onJavascriptConsoleMessage
+		*/
 
-    s_ct = Persistent<FunctionTemplate>::New(t);
-    s_ct->InstanceTemplate()->SetInternalFieldCount(1);
-    s_ct->SetClassName(String::NewSymbol("Awesomium"));
+		close_symbol = NODE_PSYMBOL("close");
+		connect_symbol = NODE_PSYMBOL("connect");
+		result_symbol = NODE_PSYMBOL("result");
+		ready_symbol = NODE_PSYMBOL("ready");
+		notify_symbol = NODE_PSYMBOL("notify");
 
-    NODE_SET_PROTOTYPE_METHOD(s_ct, "hello", Hello);
+		NODE_SET_PROTOTYPE_METHOD(t, "connect", Connect);
+		NODE_SET_PROTOTYPE_METHOD(t, "close", Close);
+		NODE_SET_PROTOTYPE_METHOD(t, "reset", Reset);
+		NODE_SET_PROTOTYPE_METHOD(t, "dispatchQuery", DispatchQuery);
+		NODE_SET_PROTOTYPE_METHOD(t, "escapeString", EscapeString);
 
-    target->Set(String::NewSymbol("Awesomium"),
-                s_ct->GetFunction());
-  }
+/*
+		t->PrototypeTemplate()->SetAccessor(READY_STATE_SYMBOL, ReadyStateGetter);
+		t->PrototypeTemplate()->SetAccessor(MAP_TUPLE_ITEMS_SYMBOL,
+																				MapTupleItemsGetter,
+																				MapTupleItemsSetter);
+*/
+		target->Set(String::NewSymbol("Awesomium"), t->GetFunction());
+	}
 
-  Awesomium() :
-    m_count(0)
-  {
-  }
+	bool Connect (const char* conninfo)
+	{
+		if (awesomium_) return false;
+		
+		/* TODO Ensure that hostaddr is always specified in conninfo to avoid
+		 * name lookup. (Unless we're connecting to localhost.)
+		 */
+		awesomium_ = PQconnectStart(conninfo);
+		if (!awesomium_) return false;
 
-  ~Awesomium()
-  {
-  }
+		if (PQsetnonblocking(awesomium_, 1) == -1) {
+			PQfinish(awesomium_);
+			awesomium_ = NULL;
+			return false;
+		}
 
-  static Handle<Value> New(const Arguments& args)
-  {
-    HandleScope scope;
-    Awesomium* hw = new Awesomium();
-    hw->Wrap(args.This());
-    return args.This();
-  }
+		ConnStatusType status = PQstatus(awesomium_);
 
-  struct hello_baton_t {
-    Awesomium *hw;
-    int increment_by;
-    int sleep_for;
-    Persistent<Function> cb;
-  };
+		if (CONNECTION_BAD == status) {
+			PQfinish(awesomium_);
+			awesomium_ = NULL;
+			return false;
+		}
 
-  static Handle<Value> Hello(const Arguments& args)
-  {
-    HandleScope scope;
+		connecting_ = true;
 
-    REQ_FUN_ARG(0, cb);
+		int fd = PQsocket(awesomium_);
 
-    Awesomium* hw = ObjectWrap::Unwrap<Awesomium>(args.This());
+		ev_io_set(&read_watcher_, fd, EV_READ);
+		ev_io_set(&write_watcher_, fd, EV_WRITE);
 
-    hello_baton_t *baton = new hello_baton_t();
-    baton->hw = hw;
-    baton->increment_by = 2;
-    baton->sleep_for = 1;
-    baton->cb = Persistent<Function>::New(cb);
+		/* If you have yet to call PQconnectPoll, i.e., just after the call to
+		 * PQconnectStart, behave as if it last returned PGRES_POLLING_WRITING.
+		 */
+		ev_io_start(EV_DEFAULT_ &write_watcher_);
+		
+		Ref();
 
-    hw->Ref();
+		return true;
+	}
 
-    eio_custom(EIO_Hello, EIO_PRI_DEFAULT, EIO_AfterHello, baton);
-    ev_ref(EV_DEFAULT_UC);
+	bool Reset ( )
+	{
+		/* To initiate a awesomium reset, call PQresetStart. If it returns 0,
+		 * the reset has failed. If it returns 1, poll the reset using
+		 * PQresetPoll in exactly the same way as you would create the
+		 * awesomium using PQconnectPoll */
+		int r = PQresetStart(awesomium_);
+		if (r == 0) return false;
 
-    return Undefined();
-  }
+		if (PQsetnonblocking(awesomium_, 1) == -1) {
+			PQfinish(awesomium_);
+			awesomium_ = NULL;
+			return false;
+		}
 
+		resetting_ = true;
+		ev_io_set(&read_watcher_, PQsocket(awesomium_), EV_READ);
+		ev_io_set(&write_watcher_, PQsocket(awesomium_), EV_WRITE);
+		ev_io_start(EV_DEFAULT_ &write_watcher_);
+		return true;
+	}
 
-  static int EIO_Hello(eio_req *req)
-  {
-    hello_baton_t *baton = static_cast<hello_baton_t *>(req->data);
+	bool Query (const char *command) 
+	{
+		int r = PQsendQuery(awesomium_, command);
+		if (r == 0) {
+			return false;
+		}
+		if (PQflush(awesomium_) == 1) ev_io_start(EV_DEFAULT_ &write_watcher_);
+		return true;
+	}
 
-    sleep(baton->sleep_for);
+	void Close (Local<Value> exception = Local<Value>())
+	{
+		HandleScope scope;
+		ev_io_stop(EV_DEFAULT_ &write_watcher_);
+		ev_io_stop(EV_DEFAULT_ &read_watcher_);
+		PQfinish(awesomium_);
+		awesomium_ = NULL;
+		if (exception.IsEmpty()) {
+			Emit(close_symbol, 0, NULL);
+		} else {
+			Emit(close_symbol, 1, &exception);
+		}
+		Unref();
+	}
 
-    baton->hw->m_count += baton->increment_by;
+	char * ErrorMessage ( )
+	{
+		return PQerrorMessage(awesomium_);
+	}
 
-    return 0;
-  }
+ protected:
 
-  static int EIO_AfterHello(eio_req *req)
-  {
-    HandleScope scope;
-    hello_baton_t *baton = static_cast<hello_baton_t *>(req->data);
-    ev_unref(EV_DEFAULT_UC);
-    baton->hw->Unref();
+	static Handle<Value>
+	New (const Arguments& args)
+	{
+		HandleScope scope;
 
-    Local<Value> argv[1];
+		Awesomium *awesomium = new Awesomium();
+		awesomium->Wrap(args.This());
 
-    argv[0] = String::New("Hello World");
+		return args.This();
+	}
 
-    TryCatch try_catch;
+	static Handle<Value>
+	Connect (const Arguments& args)
+	{
+		Awesomium *awesomium = ObjectWrap::Unwrap<Awesomium>(args.This());
 
-    baton->cb->Call(Context::GetCurrent()->Global(), 1, argv);
+		HandleScope scope;
 
-    if (try_catch.HasCaught()) {
-      FatalException(try_catch);
-    }
+		if (args.Length() == 0 || !args[0]->IsString()) {
+			return ThrowException(Exception::Error(
+						String::New("Must give conninfo string as argument")));
+		}
 
-    baton->cb.Dispose();
+		String::Utf8Value conninfo(args[0]->ToString());
 
-    delete baton;
-    return 0;
-  }
+		bool r = awesomium->Connect(*conninfo);
 
+		if (!r) {
+			return ThrowException(Exception::Error(
+						String::New(awesomium->ErrorMessage())));
+		}
+
+		return Undefined();
+	}
+
+	Awesomium () : EventEmitter () 
+	{
+		awesomium_ = NULL;
+
+		connecting_ = resetting_ = false;
+
+		ev_init(&read_watcher_, io_event);
+		read_watcher_.data = this;
+
+		ev_init(&write_watcher_, io_event);
+		write_watcher_.data = this;
+	}
+
+	~Awesomium ()
+	{
+		assert(awesomium_ == NULL);
+	}
+
+ private:
+
+	void MakeAwesomium ()
+	{
+		PostgresPollingStatusType status;
+		if (connecting_) {
+		 status = PQconnectPoll(awesomium_);
+		} else {
+		 assert(resetting_);
+		 status = PQresetPoll(awesomium_);
+		}
+
+		if (status == PGRES_POLLING_READING) {
+			ev_io_stop(EV_DEFAULT_ &write_watcher_);
+			ev_io_start(EV_DEFAULT_ &read_watcher_);
+			return;
+
+		} else if (status == PGRES_POLLING_WRITING) {
+			ev_io_stop(EV_DEFAULT_ &read_watcher_);
+			ev_io_start(EV_DEFAULT_ &write_watcher_);
+			return;
+		}
+
+		if (status == PGRES_POLLING_OK) {
+			Emit(connect_symbol, 0, NULL);
+			connecting_ = resetting_ = false;
+			ev_io_start(EV_DEFAULT_ &read_watcher_);
+			return;
+		}
+
+		CloseAwesomiumWithError();
+	}
+
+	Local<Value> BuildCell (PGresult *result, int row, int col)
+	{
+		HandleScope scope;
+
+		if (PQgetisnull(result, row, col)) return scope.Close(Null());
+
+		char *string = PQgetvalue(result, row, col);
+		int32_t n = 0, i = 0;
+
+		Oid t = PQftype(result, col);
+
+		Handle<Value> cell;
+
+		switch (t) {
+			case BOOLOID:
+				cell = *string == 't' ? True() : False();
+				break;
+
+			case INT8OID:
+			case INT4OID:
+			case INT2OID:
+				for (i = string[0] == '-' ? 1 : 0; string[i]; i++) {
+					n *= 10;
+					n += string[i] - '0';
+				}
+				if (string[0] == '-') n = -n;
+				cell = Integer::New(n);
+				break;
+
+			default:
+#ifndef NDEBUG
+//				printf("Unhandled OID: %d\n", t);
+#endif
+				cell = String::New(string);
+		}
+		return scope.Close(cell); 
+	}
+
+	Local<Value> BuildTuples (PGresult *result)
+	{
+		HandleScope scope;
+
+		int nrows = PQntuples(result);
+		int ncols = PQnfields(result);
+		int row_index, col_index;
+		char *field_name;
+
+		Local<Array> tuples = Array::New(nrows);
+
+		if (mapTupleItems_) {
+			for (row_index = 0; row_index < nrows; row_index++) {
+				Local<Object> row = Object::New();
+				tuples->Set(Integer::New(row_index), row);
+
+				for (col_index = 0; col_index < ncols; col_index++) {
+					field_name = PQfname(result, col_index);
+					Local<Value> cell = BuildCell(result, row_index, col_index); 
+					row->Set(String::New(field_name), cell);
+				}
+			}
+		} else {
+			for (row_index = 0; row_index < nrows; row_index++) {
+				Local<Array> row = Array::New(nrows);
+				tuples->Set(Integer::New(row_index), row);
+
+				for (col_index = 0; col_index < ncols; col_index++) {
+					Local<Value> cell = BuildCell(result, row_index, col_index); 
+					row->Set(Integer::New(col_index), cell);
+				}
+			}
+		}
+
+		return scope.Close(tuples);
+	}
+
+	void CloseAwesomiumWithError (const char *message_s = NULL)
+	{
+		HandleScope scope;
+
+		if (!message_s) message_s = PQerrorMessage(awesomium_);
+		Local<String> message = String::New(message_s);
+		Local<Value> exception = Exception::Error(message);
+
+		Close(exception);
+	}
+
+	static inline
+	Local<Value> BuildResultException (PGresult *result)
+	{
+		HandleScope scope;
+
+		char *primary_s = PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY);
+		assert(primary_s);
+		Local<String> primary = String::New(primary_s);
+
+		Local<Value> error_v = Exception::Error(primary);
+		assert(error_v->IsObject());
+		Local<Object> error = Local<Object>::Cast(error_v);
+
+		char *full_s = PQresultErrorMessage(result);
+		if (full_s) {
+			error->Set(String::NewSymbol("full"), String::New(full_s));
+		}
+
+		char *detail_s = PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL);
+		if (detail_s) {
+			error->Set(String::NewSymbol("detail"), String::New(detail_s));
+		}
+
+		char *severity_s = PQresultErrorField(result, PG_DIAG_SEVERITY);
+		if (severity_s) {
+			error->Set(String::NewSymbol("severity"), String::New(severity_s));
+		}
+
+		/* TODO PG_DIAG_SQLSTATE
+		 *			PG_DIAG_MESSAGE_HINT
+		 *			PG_DIAG_STATEMENT_POSITION
+		 *			PG_DIAG_INTERNAL_POSITION
+		 *			PG_DIAG_INTERNAL_QUERY
+		 *			PG_DIAG_CONTEXT
+		 *			PG_DIAG_SOURCE_FILE
+		 *			PG_DIAG_SOURCE_LINE
+		 *			PG_DIAG_SOURCE_FUNCTION
+		 */
+
+		return scope.Close(error);
+	}
+
+	void EmitResult (PGresult *result)
+	{
+		HandleScope scope;
+
+		Local<Value> tuples;
+		Local<Value> exception;
+
+		Local<Value> args[2];
+
+		switch (PQresultStatus(result)) {
+			case PGRES_EMPTY_QUERY:
+			case PGRES_COMMAND_OK:
+				Emit(result_symbol, 0, NULL);
+				break;
+
+			case PGRES_TUPLES_OK:
+				args[0] = Local<Value>::New(Null());
+				args[1] = BuildTuples(result);
+				Emit(result_symbol, 2, args);
+				break;
+
+			case PGRES_COPY_OUT:
+			case PGRES_COPY_IN:
+				assert(0 && "Not yet implemented.");
+				exception = Exception::Error(String::New("Not yet implemented"));
+				Emit(result_symbol, 1, &exception);
+				break;
+
+			case PGRES_BAD_RESPONSE:
+			case PGRES_NONFATAL_ERROR:
+			case PGRES_FATAL_ERROR:
+				exception = BuildResultException(result);
+				Emit(result_symbol, 1, &exception);
+				break;
+		}
+	}
+
+	void EmitNotify (PGnotify *notify)
+	{
+		HandleScope scope;
+
+		Local<Value> args[3];
+
+		args[0] = Local<Value>::New(String::New(notify->relname));
+		args[1] = Local<Value>::New(Integer::New(notify->be_pid));
+		args[2] = Local<Value>::New(String::New(notify->extra));
+		Emit(notify_symbol, 3, args);
+	}
+
+	void Event (int revents)
+	{
+		if (revents & EV_ERROR) {
+			CloseAwesomiumWithError("awesomium closed");
+			return;
+		}
+
+		assert(PQisnonblocking(awesomium_));
+
+		if (connecting_ || resetting_) {
+			MakeAwesomium();
+			return;
+		}
+
+		if (revents & EV_READ) {
+			if (PQconsumeInput(awesomium_) == 0) {
+				CloseAwesomiumWithError();
+				return;
+			}
+
+			if (!PQisBusy(awesomium_)) {
+				PGresult *result;
+				while ((result = PQgetResult(awesomium_))) {
+					EmitResult(result);
+					PQclear(result);
+				}
+				Emit(ready_symbol, 0, NULL);
+			}
+
+			PGnotify *notify;
+			while ((notify = PQnotifies(awesomium_))) {
+				EmitNotify(notify);
+				PQfreemem(notify);
+			}
+		}
+
+		if (revents & EV_WRITE) {
+			if (PQflush(awesomium_) == 0) ev_io_stop(EV_DEFAULT_ &write_watcher_);
+		}
+	}
+
+	static void
+	io_event (EV_P_ ev_io *w, int revents)
+	{
+		Awesomium *awesomium = static_cast<Awesomium*>(w->data);
+		awesomium->Event(revents);
+	}
+
+	ev_io read_watcher_;
+	ev_io write_watcher_;
+	PGconn *awesomium_;
+	bool connecting_;
+	bool resetting_;
+	bool mapTupleItems_;
 };
 
-Persistent<FunctionTemplate> Awesomium::s_ct;
-
-extern "C" {
-  static void init (Handle<Object> target)
-  {
-    Awesomium::Init(target);
-  }
-
-  NODE_MODULE(awesomium, init);
+extern "C" void
+init (Handle<Object> target) 
+{
+	HandleScope scope;
+	Awesomium::Initialize(target);
 }
+
 
 
 
@@ -206,7 +561,7 @@ void render (Awesomium::WebView* view, Awesomium::WebCore* core){
 		// Save our RenderBuffer directly to a JPEG image
 		std::string fname;
 		//fname = "./" + name;
-		//  char buffer [50];
+		//	char buffer [50];
 //		long lb [50];
 		//fname = "./test%s.jpg";
 		//sprintf(buffer, "test%s.jpg", "1");
