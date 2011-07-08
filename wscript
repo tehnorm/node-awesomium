@@ -15,14 +15,6 @@ def configure(conf):
 
 def build(bld):
   obj = bld.new_task_gen("cxx", "shlib", "node_addon")
-  obj.target = "awesomium"
-  obj.source = "awesomium.cpp"
+  obj.target = "nodeium"
+  obj.source = "nodeium.cpp"
   obj.includes = '.. . src src/Awesomium.framework src/Awesomium.framework/Headers' 
-  obj.cxxflags = []
-
-def shutdown():
-  if Options.commands['clean']:
-    if exists('async.node'): unlink('async.node')
-  else:
-    if exists('build/default/async.node') and not exists('async.node'):
-      symlink('build/default/async.node', 'async.node')

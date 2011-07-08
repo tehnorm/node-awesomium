@@ -64,22 +64,88 @@ class Nodeium : public EventEmitter {
 	Initialize (v8::Handle<v8::Object> target)
 	{
 		HandleScope scope;
-		// Create our WebCore singleton with the default options
-		Awesomium::WebCore* webCore = new Awesomium::WebCore();
+		Local<FunctionTemplate> t = FunctionTemplate::New(New);
+
+		t->Inherit(EventEmitter::constructor_template);
+		t->InstanceTemplate()->SetInternalFieldCount(1);
+/*
+		close_symbol = NODE_PSYMBOL("close");
+		connect_symbol = NODE_PSYMBOL("connect");
+		result_symbol = NODE_PSYMBOL("result");
+		ready_symbol = NODE_PSYMBOL("ready");
+		notify_symbol = NODE_PSYMBOL("notify");
+
+		NODE_SET_PROTOTYPE_METHOD(t, "connect", Connect);
+		NODE_SET_PROTOTYPE_METHOD(t, "close", Close);
+		NODE_SET_PROTOTYPE_METHOD(t, "reset", Reset);
+		NODE_SET_PROTOTYPE_METHOD(t, "dispatchQuery", DispatchQuery);
+		NODE_SET_PROTOTYPE_METHOD(t, "escapeString", EscapeString);
+
+		t->PrototypeTemplate()->SetAccessor(READY_STATE_SYMBOL, ReadyStateGetter);
+		t->PrototypeTemplate()->SetAccessor(MAP_TUPLE_ITEMS_SYMBOL,
+						MapTupleItemsGetter,
+						MapTupleItemsSetter);
+*/
+		target->Set(String::NewSymbol("Nodeium"), t->GetFunction());
 
 	}
 
-	static Handle<Object> createBrowser(const Arguments& args)
+	static Handle<Value> createBrowser(int height, int width)
 	{
+		// Create our WebCore singleton with the default options
+		Awesomium::WebCore* webCore = new Awesomium::WebCore();
 		
 		// Create a new WebView instance with a certain width and height, using the 
 		// WebCore we just created
-		Awesomium::WebView* webView = webCore->createWebView(args[0], args[1]);
-		return Object::New(browser);
+		Awesomium::WebView* webView = webCore->createWebView(height, width);
+		return Undefined();
+	}
+
+
+	protected:
+
+	Nodeium () : EventEmitter ()
+	{
+		webView = NULL;
+
+	//	connecting_ = resetting_ = false;
+
+		ev_init(&read_watcher_, io_event);
+		read_watcher_.data = this;
+
+		ev_init(&write_watcher_, io_event);
+		write_watcher_.data = this;
+	}
+
+	~Nodeium ()
+	{
+		assert(webView == NULL);
+	}
+
+	static Handle<Value>
+	New (const Arguments& args)
+	{
+		HandleScope scope;
+
+		Nodeium *browser = new Nodeium();
+		browser->Wrap(args.This());
+
+		return args.This();
 	}
 
 	private:
-	v8::Object *browser;
+
+	static void
+	io_event (EV_P_ ev_io *w, int revents)
+	{
+		Nodeium *webview = static_cast<Nodeium*>(w->data);
+//		connection->Event(revents);
+	}
+
+	ev_io read_watcher_;
+	ev_io write_watcher_;
+
+
 	Awesomium::WebCore *webCore;
 	Awesomium::WebView *webView;
 };
@@ -92,7 +158,7 @@ extern "C" {
 //	NODE_SET_METHOD(target, "createBrowser", createBrowser);
   }
  
-//  NODE_MODULE(awesomium, init);
+  NODE_MODULE(Nodeium, init);
 }
 
 /*
