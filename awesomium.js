@@ -1,6 +1,6 @@
-var nodeium = require("./build/default/nodeium");
+var bindings = require("./build/default/nodeium");
 
-var Awesomium = nodeium.Nodeium;
+var Awesomium = bindings.Nodeium;
 
 exports.createBrowser = function (h, w){
 	var a = new Awesomium();
