@@ -1,6 +1,6 @@
 # Node Bindings for Awesomium
 
-This is a simple API that exposes portions of the [Amwesomium](http://awesomium.com) library. In short it brings real webkit to node. Can you say browser from the command line that can do real browser things!?
+This is a simple API that exposes portions of the [Awesomium](http://www.awesomium.com) library. In short it brings real webkit to node. Can you say browser from the command line that can do real browser things!?
 
 Currently only portions of the library are exposed on the account of me knowing dang close to zero C++. So, be nice if you have feedback. Also would love some more experienced C++ hands if you have the gumption to contribute.
 
