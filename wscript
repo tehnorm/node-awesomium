@@ -17,4 +17,12 @@ def build(bld):
   obj = bld.new_task_gen("cxx", "shlib", "node_addon")
   obj.target = "nodeium"
   obj.source = "nodeium.cpp"
-  obj.includes = '.. . src src/Awesomium.framework src/Awesomium.framework/Headers' 
+  obj.includes = '.. . src src/Awesomium.framework src/Awesomium.framework/Headers'
+
+def shutdown():
+  if Options.commands['clean']:
+    if exists('nodeium.node'): unlink('nodeium.node')
+  else:
+    if exists('build/default/nodeium.node') and not exists('nodeium.node'):
+      symlink('build/default/nodeium.node', 'nodeium.node')
+
