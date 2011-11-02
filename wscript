@@ -26,6 +26,7 @@ def build(bld):
 def shutdown():
   if Options.commands['clean']:
     if exists('nodium.node'): unlink('nodium.node')
+    if exists('build/.wafpickle-7'): unlink('build/.wafpickle-7')
   else:
     if exists('build/default/nodium.node') and not exists('nodium.node'):
       symlink('build/default/nodium.node', 'nodium.node')
