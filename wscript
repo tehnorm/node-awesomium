@@ -30,4 +30,3 @@ def shutdown():
   else:
     if exists('build/default/nodium.node') and not exists('nodium.node'):
       symlink('build/default/nodium.node', 'nodium.node')
-
